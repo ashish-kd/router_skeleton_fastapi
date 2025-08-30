@@ -12,7 +12,7 @@ class Log(Base):
     kind = Column(Text, nullable=False)
     routed_agents = Column(JSONB, nullable=False)
     response = Column(JSONB, nullable=True)
-    metadata = Column(JSONB, nullable=False)
+    log_metadata = Column("metadata", JSONB, nullable=False)
 
 class DLQ(Base):
     __tablename__ = "dlq"

@@ -1,58 +1,86 @@
-from prometheus_fastapi_instrumentator import Instrumentator, metrics
+import time
 from prometheus_client import Counter, Histogram, Gauge
+from prometheus_fastapi_instrumentator import Instrumentator, metrics
 
-# Main instrumentator
-instrumentator = Instrumentator()
-
-# Custom metrics as required
-signals_received_total = Counter(
-    "signals_received_total",
-    "Total number of signals received by router",
-    ["kind"]
+# Create custom metrics
+SIGNALS_RECEIVED = Counter(
+    "signals_received_total", 
+    "Total number of signals received",
+    ["kind", "sender_id"]
 )
 
-router_latency_seconds = Histogram(
+ROUTER_LATENCY = Histogram(
     "router_latency_seconds",
-    "Router processing latency in seconds",
-    ["kind"],
-    buckets=[0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+    "Time taken for routing operations",
+    ["operation", "kind"],
+    buckets=[0.001, 0.0025, 0.005, 0.0075, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
 )
 
-routing_errors_total = Counter(
+ROUTING_ERRORS = Counter(
     "routing_errors_total",
     "Total number of routing errors",
-    ["kind", "agent"]
+    ["error_type", "agent"]
 )
 
-dlq_total = Counter(
+DLQ_TOTAL = Counter(
     "dlq_total",
-    "Total number of messages sent to DLQ",
+    "Total number of items in DLQ",
     ["reason"]
 )
 
-retry_attempts_total = Counter(
+RETRY_ATTEMPTS = Counter(
     "retry_attempts_total",
     "Total number of retry attempts",
-    ["kind", "agent"]
+    ["agent", "status"]
 )
 
-dlq_backlog = Gauge(
+AGENT_HEALTH = Gauge(
+    "agent_health",
+    "Health status of downstream agents",
+    ["agent"]
+)
+
+RATE_LIMIT_HITS = Counter(
+    "rate_limit_hits_total",
+    "Total number of rate limit hits",
+    ["sender_id"]
+)
+
+CIRCUIT_BREAKER_TRIPS = Counter(
+    "circuit_breaker_trips_total",
+    "Total number of circuit breaker trips",
+    ["agent"]
+)
+
+DLQ_BACKLOG = Gauge(
     "dlq_backlog",
-    "Current number of messages in DLQ"
+    "Current number of items in DLQ"
 )
 
-# Add custom metrics to the instrumentator
-def setup_metrics():
-    # Add default metrics with enhanced granularity
-    instrumentator.add(
-        metrics.request_size(should_include_handler=True, should_include_method=True)
-    )
-    instrumentator.add(
-        metrics.response_size(should_include_handler=True, should_include_method=True)
-    )
-    instrumentator.add(
-        metrics.latency(should_include_handler=True, should_include_method=True)
-    )
-    instrumentator.add(
-        metrics.requests(should_include_handler=True, should_include_method=True)
-    )
+# Performance timer context manager
+class TimerContextManager:
+    def __init__(self, metric, labels=None):
+        self.metric = metric
+        self.labels = labels or {}
+        self.start = None
+        
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.start:
+            duration = time.perf_counter() - self.start
+            self.metric.labels(**self.labels).observe(duration)
+
+# Set up instrumentator with custom metrics
+instrumentator = Instrumentator()
+instrumentator.add(metrics.default())
+instrumentator.add(metrics.requests())
+
+def custom_metrics():
+    return instrumentator
+
+def timer(operation, kind="unknown"):
+    """Timer context manager for measuring operation duration"""
+    return TimerContextManager(ROUTER_LATENCY, {"operation": operation, "kind": kind})

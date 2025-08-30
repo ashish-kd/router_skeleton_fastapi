@@ -1,150 +1,146 @@
-import os, json, sys, asyncio, httpx, time
-from sqlalchemy import create_engine, text
-from datetime import datetime
-import uuid
+import os
+import json
+import asyncio
+import time
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+import logging
 
-# Add app directory to path for imports
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from app.router import agents_for, now_iso
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("dlq_replay")
 
+# Get database URL from environment or use default
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://postgres:postgres@localhost:5432/routerdb")
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-API_ENDPOINT = "http://localhost:8000/route"
-API_KEY = os.getenv("API_KEY", "dev-key")
+ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql+psycopg2", "postgresql+asyncpg")
 
-async def process_dlq_entry(id_: int, log_id: str, payload: dict):
-    """Process a single DLQ entry with retry logic"""
+# Create async engine
+async_engine = create_async_engine(
+    ASYNC_DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=5,
+    echo=False,
+)
+
+AsyncSessionLocal = sessionmaker(
+    bind=async_engine, 
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autocommit=False, 
+    autoflush=False
+)
+
+async def get_db():
+    """Get database session"""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+
+async def replay_item(db: AsyncSession, id_: int, log_id: str, payload_text: str):
+    """Replay a single DLQ item with error handling"""
     try:
-        # Extract the original request
-        request = payload.get("request", {})
-        if not request:
-            print(f"⚠️ Invalid payload format for DLQ id={id_}, skipping")
-            return False
-            
-        # Get or generate a trace ID
-        trace_id = payload.get("trace_id", uuid.uuid4().hex)
+        # Parse the payload
+        payload = json.loads(payload_text)
+        sender_id = payload.get("sender_id", "unknown")
         
-        # Determine the kind of request
-        kind = request.get("kind")
-        if not kind:
-            # Try to get the kind from the logs table
-            with engine.begin() as conn:
-                result = conn.execute(
-                    text("SELECT kind FROM logs WHERE log_id = :log_id"),
-                    {"log_id": log_id}
-                ).first()
-                if result:
-                    kind = result[0]
-                else:
-                    kind = "unknown"
+        # Determine what kind of message it is (simplified classification)
+        kind = "assist"  # Default
+        if isinstance(payload.get("payload"), dict):
+            msg = json.dumps(payload.get("payload", {})).lower()
+            if any(k in msg for k in ["emergency", "urgent", "crisis"]):
+                kind = "emergency"
+            elif any(k in msg for k in ["policy", "compliance"]):
+                kind = "policy"
         
-        # Get the appropriate agents
-        routed_agents = agents_for(kind)
-        if "DLQ" in routed_agents:
-            routed_agents.remove("DLQ")  # Don't route back to DLQ
-            if not routed_agents:  # If only DLQ was present
-                routed_agents = ["Axis"]  # Default to Axis as fallback
+        # Insert into logs table using f-string to avoid parameter binding issues
+        routed_agents_json = json.dumps(["Axis"]).replace("'", "''")
+        response_json = json.dumps({"status": "replayed", "source": "dlq_replay"}).replace("'", "''")
+        metadata_json = json.dumps({
+            "replayed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "original_dlq_id": id_
+        }).replace("'", "''")
         
-        # For simplicity, simulate successful replay for known agent types
-        success = True if routed_agents and routed_agents != ["DLQ"] else False
+        sql = f"""
+            INSERT INTO logs (log_id, sender_id, kind, routed_agents, response, metadata)
+            VALUES ('{log_id}', '{sender_id}', '{kind}', '{routed_agents_json}'::jsonb, '{response_json}'::jsonb, '{metadata_json}'::jsonb)
+            ON CONFLICT (log_id) DO UPDATE SET 
+                response = '{response_json}'::jsonb,
+                metadata = logs.metadata || '{metadata_json}'::jsonb
+        """
+        await db.execute(text(sql))
         
-        with engine.begin() as conn:
-            if success:
-                # Update logs table
-                conn.execute(text("""
-                    INSERT INTO logs (log_id, ts, sender_id, kind, routed_agents, response, metadata)
-                    VALUES (:log_id, NOW(), :sender_id, :kind, CAST(:routed_agents AS jsonb), CAST(:response AS jsonb), CAST(:metadata AS jsonb))
-                    ON CONFLICT (log_id) DO UPDATE SET
-                        response = CAST(:response AS jsonb),
-                        metadata = logs.metadata || CAST(:metadata AS jsonb)
-                """), {
-                    "log_id": log_id,
-                    "sender_id": request.get("sender_id", "dlq_replay"),
-                    "kind": kind,
-                    "routed_agents": json.dumps(routed_agents),
-                    "response": json.dumps({
-                        "status": "replayed",
-                        "routed_agents": routed_agents,
-                        "trace_id": trace_id
-                    }),
-                    "metadata": json.dumps({
-                        "replayed_at": datetime.utcnow().isoformat(),
-                        "trace_id": trace_id
-                    })
-                })
-                
-                # Delete from DLQ
-                conn.execute(text("DELETE FROM dlq WHERE id = :id"), {"id": id_})
-                print(f"✅ Successfully replayed DLQ id={id_}, log_id={log_id}")
-                return True
-            else:
-                # Increment retry counter
-                attempts = conn.execute(
-                    text("SELECT attempts FROM dlq WHERE id = :id"),
-                    {"id": id_}
-                ).scalar()
-                
-                if attempts >= 3:  # Max retries
-                    print(f"❌ Max retries reached for DLQ id={id_}, log_id={log_id}. Keeping in DLQ.")
-                    return False
-                
-                # Update attempts counter
-                conn.execute(
-                    text("UPDATE dlq SET attempts = attempts + 1 WHERE id = :id"),
-                    {"id": id_}
-                )
-                print(f"⚠️ Failed to replay DLQ id={id_}, log_id={log_id}. Incremented retry counter to {attempts + 1}.")
-                return False
-    
+        # Delete from DLQ
+        await db.execute(text(f"DELETE FROM dlq WHERE id = {id_}"))
+        await db.commit()
+        logger.info(f"Successfully replayed DLQ item id={id_}, log_id={log_id}")
+        return True
     except Exception as e:
-        print(f"❌ Error processing DLQ id={id_}, log_id={log_id}: {str(e)}")
+        await db.rollback()
+        logger.error(f"Error replaying DLQ item id={id_}: {str(e)}")
+        
+        # Update attempts count
+        try:
+            await db.execute(text(f"UPDATE dlq SET attempts = attempts + 1 WHERE id = {id_}"))
+            await db.commit()
+        except Exception:
+            pass
+            
         return False
 
-async def replay_async(limit: int, retry_delay: float = 0.5):
-    """Replay DLQ entries with bounded concurrency"""
-    print(f"Starting replay of up to {limit} DLQ entries...")
+async def replay(limit: int, dry_run: bool = False):
+    """Replay DLQ items up to the limit"""
+    start_time = time.time()
+    success_count = 0
+    error_count = 0
     
-    # Get DLQ entries
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT id, log_id, payload FROM dlq ORDER BY ts ASC LIMIT :l"), 
-            {"l": limit}
-        ).fetchall()
+    logger.info(f"Starting DLQ replay with limit={limit}, dry_run={dry_run}")
     
-    if not rows:
-        print("No DLQ entries found to replay.")
-        return
-    
-    print(f"Found {len(rows)} DLQ entries to process.")
-    
-    # Process entries with a small delay between them to avoid overloading the system
-    successful = 0
-    failed = 0
-    
-    for idx, (id_, log_id, payload) in enumerate(rows):
-        try:
-            # payload is already a dict from JSONB column
-            if await process_dlq_entry(id_, log_id, payload):
-                successful += 1
-            else:
-                failed += 1
-        except Exception as e:
-            print(f"⚠️ Error processing DLQ payload for id={id_}: {e}")
-            failed += 1
+    async with AsyncSessionLocal() as db:
+        # Get DLQ items to replay
+        result = await db.execute(text(f"""
+            SELECT id, log_id, payload::text 
+            FROM dlq 
+            ORDER BY ts ASC, attempts ASC
+            LIMIT {limit}
+        """))
         
-        # Small delay between processing entries
-        if idx < len(rows) - 1:  # No need to delay after the last one
-            await asyncio.sleep(retry_delay)
-    
-    print(f"DLQ replay completed: {successful} successful, {failed} failed")
+        rows = result.fetchall()
+        total = len(rows)
+        
+        if total == 0:
+            logger.info("No DLQ items to replay")
+            return
+            
+        logger.info(f"Found {total} DLQ items to replay")
+        
+        if dry_run:
+            for (id_, log_id, payload_text) in rows:
+                logger.info(f"Would replay: id={id_}, log_id={log_id}")
+            return
+            
+        # Process each DLQ item
+        for (id_, log_id, payload_text) in rows:
+            success = await replay_item(db, id_, log_id, payload_text)
+            if success:
+                success_count += 1
+            else:
+                error_count += 1
+                
+    duration = time.time() - start_time
+    logger.info(f"DLQ replay complete: processed {total}, success={success_count}, error={error_count}, duration={duration:.2f}s")
 
-def replay(limit: int):
-    """Entry point for CLI tool"""
-    asyncio.run(replay_async(limit))
+async def main():
+    """Main function"""
+    import argparse
+    ap = argparse.ArgumentParser(description='Replay messages from DLQ')
+    ap.add_argument("--limit", type=int, default=100, help="Maximum number of items to replay")
+    ap.add_argument("--dry-run", action="store_true", help="Show what would be replayed without actually doing it")
+    args = ap.parse_args()
+    
+    await replay(args.limit, args.dry_run)
 
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=100)
-    args = ap.parse_args()
-    replay(args.limit)
+    asyncio.run(main())
