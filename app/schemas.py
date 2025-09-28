@@ -2,21 +2,31 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any, Union
 
 class RouteRequest(BaseModel):
-    """Request model for the routing endpoint"""
-    log_id: Optional[str] = None
-    timestamp: Optional[str] = None
-    sender_id: str
-    payload: Dict[str, Any]
-    kind: Optional[str] = None
+    """Request model for the routing endpoint - specification format only"""
+    tenant_id: str  # Required - multi-tenant identifier
+    event_id: Optional[str] = None  # Optional - unique event identifier
+    user_id: Optional[str] = None   # Optional - user identifier (used with ts if no event_id)
+    payload_version: int = 1  # Required - payload version for compatibility
+    type: Optional[str] = None  # Optional - event type (e.g., "breath_check_in")
+    ts: Optional[str] = None  # Optional - timestamp, will use current time if not provided
+    kind: Optional[str] = None  # Optional classification override
     
+    # Everything else goes in the root (like biometrics, text, message, etc.)
     model_config = ConfigDict(
+        extra="allow",  # Allow additional fields in root
         json_schema_extra={
             "example": {
-                "sender_id": "user_123",
-                "payload": {"message": "Help me understand policy"},
-                "kind": None,  # Optional, will be auto-detected if not provided
-                "log_id": None,  # Optional, will be auto-generated if not provided
-                "timestamp": None  # Optional, will use current time if not provided
+                "tenant_id": "t1", 
+                "event_id": "f0b8c5f2-8a0b-4b1d-9a9e-55b4f4c0b111",
+                "user_id": "u1",
+                "payload_version": 1,
+                "type": "breath_check_in",
+                "ts": "2025-09-20T10:20:30Z",
+                "biometrics": {
+                    "breath_rate_bpm": 22,
+                    "hrv_ms": 48
+                },
+                "text": "Feeling tight in my chest"
             }
         }
     )
