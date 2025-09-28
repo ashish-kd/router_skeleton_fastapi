@@ -5,17 +5,16 @@ import uuid
 import asyncio
 import httpx
 from typing import List, Tuple, Dict, Any, Optional, Union
-from aiocache import cached
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 from app.metrics import (
-    SIGNALS_RECEIVED, ROUTER_LATENCY, ROUTING_ERRORS,
-    DLQ_TOTAL, AGENT_HEALTH, timer
+    ROUTER_INGRESS_TOTAL, ROUTER_LATENCY_SECONDS, ROUTER_DOWNSTREAM_SUCCESS_TOTAL,
+    ROUTER_DOWNSTREAM_FAIL_TOTAL, ROUTER_DLQ_TOTAL, timer
 )
 from app.utils import (
     with_retry, execute_parallel, circuit_breaker, 
-    rate_limiter, logger, cache
+    rate_limiter, logger
 )
 
 # Agent configuration - would normally be in database or config
@@ -40,8 +39,7 @@ KEYWORDS = {
     "assist": ["help", "assist", "question", "explain", "clarify"]
 }
 
-# Enhanced classifier with confidence scoring
-@cached(ttl=300, namespace="classifier")
+# Enhanced classifier with confidence scoring (now cacheless)
 async def classify(payload: dict) -> Tuple[str, float]:
     """
     Classify the payload based on keywords with confidence scoring
@@ -63,16 +61,72 @@ async def classify(payload: dict) -> Tuple[str, float]:
         
     return "unknown", 0.5
 
-# Cache agent map for 5 minutes
-@cached(ttl=300, namespace="agents")
 async def agents_for(kind: str) -> List[str]:
-    """Get list of agents for a given kind"""
+    """Get list of agents for a given kind (now cacheless)"""
     return KIND_MAP.get(kind, ["DLQ"])
 
-def deterministic_log_id(sender_id: str, ts_iso: str, payload: dict) -> str:
-    """Generate a deterministic log_id from inputs"""
-    h = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
-    return f"{sender_id}:{ts_iso}:{h}"
+def generate_canonical_message_id(
+    tenant_id: str, 
+    event_id: Optional[str], 
+    user_id: Optional[str], 
+    ts_iso: str, 
+    payload_version: int, 
+    payload: Dict[str, Any]
+) -> str:
+    """
+    Generate a canonical message_id based on deterministic hash
+    
+    Format: hash(tenant_id, (event_id || user_id+ts), payload_version, canonical_payload)
+    Per specification requirements for PR 2
+    """
+    # Create canonical payload by removing volatile fields
+    canonical_payload = {k: v for k, v in payload.items() 
+                        if k not in ["trace_id", "timestamp", "ts"]}
+    
+    # Sort keys for deterministic JSON
+    canonical_json = json.dumps(canonical_payload, sort_keys=True, separators=(',', ':'))
+    
+    # Determine identifier - use event_id if available, otherwise user_id+ts
+    if event_id:
+        identifier = event_id
+    elif user_id:
+        identifier = f"{user_id}:{ts_iso}"
+    else:
+        # Fallback to a hash of the payload if neither is available
+        identifier = hashlib.sha256(canonical_json.encode()).hexdigest()[:16]
+    
+    # Create the components to hash
+    hash_components = f"{tenant_id}:{identifier}:{payload_version}:{canonical_json}"
+    
+    # Generate deterministic hash
+    message_hash = hashlib.sha256(hash_components.encode()).hexdigest()[:32]  # 32 chars for better uniqueness
+    
+    return message_hash
+
+async def check_message_duplicate(db: AsyncSession, message_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Check if a message_id already exists in the logs table
+    Returns existing record data if found, None otherwise
+    """
+    try:
+        result = await db.execute(
+            text("SELECT log_id, kind, routed_agents::text, response::text FROM logs WHERE log_id = :message_id"),
+            {"message_id": message_id}
+        )
+        existing = result.fetchone()
+        
+        if existing:
+            log_id, kind, routed_agents, response = existing
+            return {
+                "log_id": log_id,
+                "kind": kind,
+                "routed_agents": json.loads(routed_agents or "[]"),
+                "response": json.loads(response or "{}")
+            }
+        return None
+    except Exception as e:
+        logger.error("Error checking for duplicates", message_id=message_id, error=str(e))
+        return None
 
 def now_iso() -> str:
     """Get current UTC time in ISO format"""
@@ -103,7 +157,7 @@ async def call_agent(
     
     endpoint = AGENT_ENDPOINTS.get(agent)
     if not endpoint:
-        ROUTING_ERRORS.labels(error_type="missing_endpoint", agent=agent).inc()
+        ROUTER_DOWNSTREAM_FAIL_TOTAL.labels(service=agent, reason="missing_endpoint").inc()
         raise Exception(f"No endpoint configured for agent {agent}")
     
     try:
@@ -118,21 +172,19 @@ async def call_agent(
                 )
         
         if response.status_code >= 200 and response.status_code < 300:
-            # Record success for circuit breaker
+            # Record success for circuit breaker and metrics
             circuit_breaker.record_success(agent)
-            AGENT_HEALTH.labels(agent=agent).set(1)
+            ROUTER_DOWNSTREAM_SUCCESS_TOTAL.labels(service=agent).inc()
             return response.json()
         else:
-            # Record failure for circuit breaker
+            # Record failure for circuit breaker and metrics
             circuit_breaker.record_failure(agent)
-            AGENT_HEALTH.labels(agent=agent).set(0)
-            ROUTING_ERRORS.labels(error_type="status_error", agent=agent).inc()
+            ROUTER_DOWNSTREAM_FAIL_TOTAL.labels(service=agent, reason="status_error").inc()
             raise Exception(f"Agent {agent} returned status {response.status_code}")
     except Exception as e:
-        # Record failure for circuit breaker
+        # Record failure for circuit breaker and metrics
         circuit_breaker.record_failure(agent)
-        AGENT_HEALTH.labels(agent=agent).set(0)
-        ROUTING_ERRORS.labels(error_type="call_error", agent=agent).inc()
+        ROUTER_DOWNSTREAM_FAIL_TOTAL.labels(service=agent, reason="call_error").inc()
         logger.error("Agent call failed", 
                    agent=agent, 
                    error=str(e),
@@ -152,7 +204,7 @@ async def add_to_dlq(
     """
     for attempt in range(max_retries):
         try:
-            DLQ_TOTAL.labels(reason=reason).inc()
+            ROUTER_DLQ_TOTAL.labels(reason=reason).inc()
             
             # Raw SQL insert to avoid issues with parameter binding
             payload_json = json.dumps(payload).replace("'", "''")
@@ -208,8 +260,15 @@ async def route_to_agents(
     Route payload to appropriate agents with parallel execution
     Returns (routed_agents, response)
     """
-    # Record metric
-    SIGNALS_RECEIVED.labels(kind=kind, sender_id=payload.get("sender_id", "unknown")).inc()
+    # Check if this is a duplicate/replay - only count new messages for ingress metrics
+    existing_check = await db.execute(
+        text("SELECT 1 FROM logs WHERE log_id = :log_id"),
+        {"log_id": log_id}
+    )
+    
+    # Only record ingress metric for new requests (not duplicates/replays)
+    if not existing_check.fetchone():
+        ROUTER_INGRESS_TOTAL.labels(type=kind).inc()
     
     with timer(operation="route_to_agents", kind=kind):
         # Determine agents to route to

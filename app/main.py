@@ -11,13 +11,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db, execute_query, AsyncSessionLocal
-from app.metrics import instrumentator, timer, ROUTER_LATENCY, DLQ_BACKLOG
+from app.metrics import instrumentator, timer, ROUTER_LATENCY_SECONDS, DLQ_BACKLOG, ROUTER_REJECTED_TOTAL
 from app.schemas import RouteRequest, RouteResponse, LogOut, HealthResponse
 from app.utils import rate_limiter, logger
 from app.logging import TraceMiddleware, init_logging
 from app.router import (
-    classify, agents_for, deterministic_log_id, now_iso, 
-    new_trace_id, route_to_agents
+    classify, agents_for, now_iso, 
+    new_trace_id, route_to_agents, generate_canonical_message_id, check_message_duplicate
 )
 
 # Configuration
@@ -111,11 +111,15 @@ async def auto_replay_dlq():
                 if dlq_count > 0:
                     logger.info(f"DLQ has {dlq_count} messages, attempting automated replay of {AUTO_REPLAY_BATCH_SIZE}")
                     
-                    # Import and run the replay function
+                    # Import and run the replay function - USE DEDICATED REPLAY LOGIC
                     try:
                         from db.replay_dlq import replay
                         
-                        # Replay a batch of messages (replay function doesn't return count)
+                        # Record replay attempt metrics (separate from ingress)
+                        from app.metrics import ROUTER_REPLAY_RUNS_TOTAL
+                        ROUTER_REPLAY_RUNS_TOTAL.labels(mode="automated").inc()
+                        
+                        # Replay a batch of messages using DIRECT replay (not main route function)
                         await replay(AUTO_REPLAY_BATCH_SIZE, dry_run=False)
                         logger.info(f"Automated DLQ replay: attempted to process {AUTO_REPLAY_BATCH_SIZE} messages")
                             
@@ -186,56 +190,85 @@ async def health(db: AsyncSession = Depends(get_db)):
 @app.post("/route", response_model=RouteResponse, dependencies=[Depends(require_api_key), Depends(check_rate_limit)])
 async def route(req: RouteRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     # Start timing the operation
-    with timer(operation="total_route", kind=req.kind or "unknown"):
+    with timer(operation="total_route", kind=req.kind or req.type or "unknown"):
         # Generate essential data
-        ts = req.timestamp or now_iso()
-        log_id = req.log_id or deterministic_log_id(req.sender_id, ts, req.payload)
+        ts = req.ts or now_iso()
         trace_id = new_trace_id()
         
+        # Extract payload for classification (everything except metadata fields)
+        classification_payload = req.model_dump(exclude={
+            'tenant_id', 'event_id', 'user_id', 'payload_version', 
+            'type', 'ts', 'kind'
+        })
+        
+        # Generate canonical message_id
+        message_id = generate_canonical_message_id(
+            tenant_id=req.tenant_id,
+            event_id=req.event_id,
+            user_id=req.user_id,
+            ts_iso=ts,
+            payload_version=req.payload_version,
+            payload=classification_payload
+        )
+        
         # Check for duplicates (idempotency)
-        if log_id:
-            result = await db.execute(
-                text("SELECT kind, routed_agents::text, response::text FROM logs WHERE log_id = :log_id"),
-                {"log_id": log_id}
-            )
-            existing = result.fetchone()
+        existing = await check_message_duplicate(db, message_id)
+        if existing:
+            logger.info("Duplicate request detected", 
+                       message_id=message_id, 
+                       trace_id=trace_id,
+                       tenant_id=req.tenant_id)
+            # Record duplicate metric
+            from app.metrics import ROUTER_REJECTED_TOTAL
+            ROUTER_REJECTED_TOTAL.labels(reason="duplicate").inc()
             
-            if existing:
-                logger.info("Duplicate request detected", log_id=log_id, trace_id=trace_id)
-                kind, ra, resp = existing
-                return RouteResponse(
-                    status="already_processed",
-                    routed_agents=json.loads(ra or "[]"),
-                    trace_id=trace_id
-                )
+            return RouteResponse(
+                status="already_processed",
+                routed_agents=existing["routed_agents"],
+                trace_id=trace_id
+            )
         
         # Classify if kind not provided
         if not req.kind:
-            kind, confidence = await classify(req.payload)
+            kind, confidence = await classify(classification_payload)
         else:
             kind, confidence = req.kind, 1.0
             
+        # Prepare payload for routing (include relevant fields)
+        routing_payload = {
+            "tenant_id": req.tenant_id,
+            "user_id": req.user_id,
+            "message_id": message_id,
+            "ts": ts,
+            "type": req.type,
+            **classification_payload
+        }
+        
         # Route to appropriate agents with parallel processing
-        routed_agents, response = await route_to_agents(db, log_id, kind, req.payload, trace_id)
+        routed_agents, response = await route_to_agents(db, message_id, kind, routing_payload, trace_id)
         
-        # IMPORTANT: At this point, routing is complete and successful
-        # Logging failures should NOT affect the user response
-        
-        # Attempt to log to database (non-blocking for user response)
+        # Attempt to log to database
         try:
-            # Use string formatting to avoid binding issues
             metadata_json = json.dumps({
                 "trace_id": trace_id,
                 "confidence": confidence,
-                "processing_time_ms": round(time.time() - time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")) * 1000, 2)
+                "tenant_id": req.tenant_id,
+                "payload_version": req.payload_version,
+                "event_id": req.event_id,
+                "user_id": req.user_id,
+                "type": req.type,
+                "processing_time_ms": round((time.time() - time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))) * 1000, 2)
             }).replace("'", "''")
             
             routed_agents_json = json.dumps(routed_agents).replace("'", "''")
             response_json = json.dumps(response).replace("'", "''")
             
+            # Use user_id for sender_id field in database
+            sender_id_for_db = req.user_id or "unknown"
+            
             sql = f"""
             INSERT INTO logs (log_id, ts, sender_id, kind, routed_agents, response, metadata)
-            VALUES ('{log_id}', '{ts}', '{req.sender_id}', '{kind}', 
+            VALUES ('{message_id}', '{ts}', '{sender_id_for_db}', '{kind}', 
                     '{routed_agents_json}'::jsonb, 
                     '{response_json}'::jsonb, 
                     '{metadata_json}'::jsonb)
@@ -246,38 +279,28 @@ async def route(req: RouteRequest, background_tasks: BackgroundTasks, db: AsyncS
             await db.execute(text(sql))
             await db.commit()
             
-            logger.info("Operation logged successfully", log_id=log_id)
+            logger.info("Operation logged successfully", log_id=message_id)
             
         except Exception as e:
-            # Database logging failed, but routing succeeded
-            logger.error(
-                "Failed to log operation to database", 
-                log_id=log_id,
-                error=str(e)
-            )
-            
-            # Try to rollback
+            logger.error("Failed to log operation to database", log_id=message_id, error=str(e))
             try:
                 await db.rollback()
             except:
                 pass
-                
+            
             # Log to structured logs as fallback
             logger.info(
                 "operation_completed_unlogged",
-                log_id=log_id,
-                sender_id=req.sender_id,
+                log_id=message_id,
+                user_id=req.user_id,
                 kind=kind,
                 routed_agents=routed_agents,
                 response=response,
                 trace_id=trace_id,
                 event="logging_fallback"
             )
-            
-            # Add metadata to response to indicate logging issue
             response = {**response, "logging_status": "failed"}
         
-        # Always return success if routing worked
         return RouteResponse(
             status=response.get("status", "routed"),
             routed_agents=routed_agents,
