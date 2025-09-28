@@ -1,0 +1,25 @@
+name: Smoke Tests
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Run smoke tests
+      run: bash .ci/smoke.sh
+      
+    - name: Clean up
+      if: always()
+      run: docker compose down -v
