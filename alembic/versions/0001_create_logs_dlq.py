@@ -15,6 +15,7 @@ branch_labels = None
 depends_on = None
 
 def upgrade():
+    # Create logs table
     op.create_table(
         'logs',
         sa.Column('log_id', sa.Text, primary_key=True),
@@ -25,9 +26,12 @@ def upgrade():
         sa.Column('response', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
         sa.Column('metadata', postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'{}'::jsonb")),
     )
+    
+    # Create indexes for logs table
     op.create_index('ix_logs_sender_id', 'logs', ['sender_id'])
     op.create_index('ix_logs_ts_desc', 'logs', ['ts'])
-
+    
+    # Create DLQ table
     op.create_table(
         'dlq',
         sa.Column('id', sa.Integer, primary_key=True),
@@ -37,8 +41,13 @@ def upgrade():
         sa.Column('payload', postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'{}'::jsonb")),
         sa.Column('attempts', sa.Integer, nullable=False, server_default='0'),
     )
+    
+    op.create_index('ix_dlq_log_id', 'dlq', ['log_id']) 
+    op.create_index('ix_dlq_replay_order', 'dlq', ['ts', 'attempts'])
 
 def downgrade():
+    op.drop_index('ix_dlq_replay_order', table_name='dlq')
+    op.drop_index('ix_dlq_log_id', table_name='dlq')
     op.drop_table('dlq')
     op.drop_index('ix_logs_ts_desc', table_name='logs')
     op.drop_index('ix_logs_sender_id', table_name='logs')
