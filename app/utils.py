@@ -4,7 +4,6 @@ import logging
 import structlog
 from typing import Dict, Callable, Any, Optional, List
 from datetime import datetime, timedelta
-from aiocache import Cache
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -12,13 +11,9 @@ from tenacity import (
     retry_if_exception_type,
     RetryError
 )
-from app.metrics import RETRY_ATTEMPTS, CIRCUIT_BREAKER_TRIPS, RATE_LIMIT_HITS
 
 # Configure structured logging
 logger = structlog.get_logger()
-
-# Cache for routing rules and responses
-cache = Cache(namespace="router")
 
 # Rate limiting implementation
 class RateLimiter:
@@ -48,7 +43,9 @@ class RateLimiter:
         
         # Check if limit exceeded
         if total_requests >= self.limit_per_second * self.window_size:
-            RATE_LIMIT_HITS.labels(sender_id=sender_id).inc()
+            # Use logging instead of metrics for rate limiting events
+            logger.warning("Rate limit exceeded", sender_id=sender_id, 
+                         requests_in_window=total_requests, limit=self.limit_per_second)
             return False
             
         # Update counter
@@ -97,9 +94,10 @@ class CircuitBreaker:
         
         if self.failure_counts[agent] >= self.failure_threshold:
             self.circuit_open_until[agent] = datetime.now() + timedelta(seconds=self.recovery_time)
-            CIRCUIT_BREAKER_TRIPS.labels(agent=agent).inc()
+            # Use logging instead of metrics for circuit breaker events
             logger.warning("Circuit breaker tripped", agent=agent, 
-                         until=self.circuit_open_until[agent].isoformat())
+                         until=self.circuit_open_until[agent].isoformat(),
+                         failure_count=self.failure_counts[agent])
             return True
         return False
 
@@ -119,12 +117,12 @@ def with_retry(max_attempts: int = 3, min_wait_ms: int = 100, max_wait_ms: int =
         async def wrapper(*args, **kwargs):
             agent = kwargs.get('agent', 'unknown')
             try:
-                RETRY_ATTEMPTS.labels(agent=agent, status="attempt").inc()
+                # Use logging instead of metrics for retry events
+                logger.debug("Retry attempt starting", agent=agent)
                 result = await func(*args, **kwargs)
-                RETRY_ATTEMPTS.labels(agent=agent, status="success").inc()
+                logger.debug("Retry attempt succeeded", agent=agent)
                 return result
             except Exception as e:
-                RETRY_ATTEMPTS.labels(agent=agent, status="failure").inc()
                 logger.warning("Retry attempt failed", 
                              agent=agent, 
                              error=str(e),

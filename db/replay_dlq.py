@@ -40,27 +40,48 @@ async def get_db():
             await session.close()
 
 async def replay_item(db: AsyncSession, id_: int, log_id: str, payload_text: str):
-    """Replay a single DLQ item with error handling"""
+    """Replay a single DLQ item with error handling and pre-replay deduplication"""
     try:
+        # Import replay-specific metrics
+        from app.metrics import ROUTER_REPLAY_ITEMS_TOTAL
+        
         # Parse the payload
         payload = json.loads(payload_text)
-        sender_id = payload.get("sender_id", "unknown")
+        sender_id = payload.get("user_id", "unknown")  # Use user_id from new format
+        
+        # **PR 2: Pre-replay deduplication check**
+        # Check if this message_id already exists in logs table
+        existing_check = await db.execute(
+            text("SELECT 1 FROM logs WHERE log_id = :log_id"),
+            {"log_id": log_id}
+        )
+        if existing_check.fetchone():
+            logger.info(f"Skipping replay - message already processed: log_id={log_id}")
+            # Delete from DLQ since it's already processed
+            await db.execute(text(f"DELETE FROM dlq WHERE id = {id_}"))
+            await db.commit()
+            
+            # Record as skipped replay (not new ingress)
+            ROUTER_REPLAY_ITEMS_TOTAL.labels(mode="automated", outcome="skipped").inc()
+            return True
         
         # Determine what kind of message it is (simplified classification)
         kind = "assist"  # Default
-        if isinstance(payload.get("payload"), dict):
-            msg = json.dumps(payload.get("payload", {})).lower()
-            if any(k in msg for k in ["emergency", "urgent", "crisis"]):
-                kind = "emergency"
-            elif any(k in msg for k in ["policy", "compliance"]):
-                kind = "policy"
+        
+        # Use the entire payload for classification (new format)
+        msg = json.dumps(payload).lower()
+        if any(k in msg for k in ["emergency", "urgent", "crisis"]):
+            kind = "emergency"
+        elif any(k in msg for k in ["policy", "compliance"]):
+            kind = "policy"
         
         # Insert into logs table using f-string to avoid parameter binding issues
         routed_agents_json = json.dumps(["Axis"]).replace("'", "''")
         response_json = json.dumps({"status": "replayed", "source": "dlq_replay"}).replace("'", "''")
         metadata_json = json.dumps({
             "replayed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "original_dlq_id": id_
+            "original_dlq_id": id_,
+            "replay_deduplication_check": "passed"
         }).replace("'", "''")
         
         sql = f"""
@@ -75,11 +96,19 @@ async def replay_item(db: AsyncSession, id_: int, log_id: str, payload_text: str
         # Delete from DLQ
         await db.execute(text(f"DELETE FROM dlq WHERE id = {id_}"))
         await db.commit()
+        
+        # Record successful replay (NOT as new ingress traffic)
+        ROUTER_REPLAY_ITEMS_TOTAL.labels(mode="automated", outcome="success").inc()
+        
         logger.info(f"Successfully replayed DLQ item id={id_}, log_id={log_id}")
         return True
     except Exception as e:
         await db.rollback()
         logger.error(f"Error replaying DLQ item id={id_}: {str(e)}")
+        
+        # Record failed replay (NOT as ingress traffic)
+        from app.metrics import ROUTER_REPLAY_ITEMS_TOTAL
+        ROUTER_REPLAY_ITEMS_TOTAL.labels(mode="automated", outcome="error").inc()
         
         # Update attempts count
         try:

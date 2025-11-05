@@ -46,22 +46,31 @@ TOPICS = [
 ]
 
 def generate_random_message() -> Dict[str, Any]:
-    """Generate a random message for load testing"""
+    """Generate a random message for load testing using specification format"""
     # Select random message type and template
     message_type = random.choice(MESSAGE_TYPES)
     template = random.choice(message_type["templates"])
     topic = random.choice(TOPICS)
     
-    # Generate message
-    message = template.format(topic=topic)
+    # Generate message text
+    message_text = template.format(topic=topic)
     
     # Add some random data to make each message unique
     rand_suffix = ''.join(random.choice(string.ascii_letters) for _ in range(8))
     
+    # Generate specification-compliant request
     return {
-        "message": message,
-        "timestamp": time.time(),
-        "request_id": rand_suffix
+        "tenant_id": f"tenant_{random.randint(1, 3)}",  # Multiple tenants for testing
+        "user_id": f"user_{rand_suffix}",
+        "payload_version": 1,
+        "type": message_type["type"] + "_request", 
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "text": message_text,
+        "metadata": {
+            "source": "load_test",
+            "request_id": rand_suffix,
+            "priority": random.choice(["normal", "high"]) if message_type["type"] == "emergency" else "normal"
+        }
     }
 
 async def send_request(
@@ -71,17 +80,16 @@ async def send_request(
     results: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
     """Send a single request and collect metrics"""
-    # Generate payload
-    payload = generate_random_message()
-    req_data = {
-        "sender_id": sender_id,
-        "payload": payload
-    }
+    # Generate specification-compliant payload
+    req_data = generate_random_message()
     
-    # Sometimes include a specific kind to test that path
+    # Sometimes include event_id for testing canonical message_id generation
+    if random.random() < 0.3:
+        req_data["event_id"] = f"evt_{random.randint(1000, 9999)}"
+    
+    # Sometimes override kind for testing classification override
     if random.random() < 0.1:
-        kinds = ["assist", "policy", "emergency"]
-        req_data["kind"] = random.choice(kinds)
+        req_data["kind"] = random.choice(["assist", "policy", "emergency"])
     
     start_time = time.perf_counter()
     
@@ -187,6 +195,15 @@ def analyze_results(results: List[Dict[str, Any]]):
     if not results:
         CONSOLE.print("[bold red]No results collected![/]")
         return
+    
+    # Show first few errors for debugging
+    errors = [r for r in results if not r["success"]]
+    if errors:
+        CONSOLE.print(f"[bold red]Found {len(errors)} errors. First few:[/]")
+        for i, error in enumerate(errors[:3]):
+            CONSOLE.print(f"  Error {i+1}: Status {error['status_code']}")
+            if 'error' in error:
+                CONSOLE.print(f"    Message: {error['error'][:200]}...")
     
     # Extract durations
     durations = [r["duration_ms"] for r in results if r["success"]]

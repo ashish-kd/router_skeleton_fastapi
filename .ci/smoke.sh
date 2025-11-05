@@ -3,10 +3,15 @@ set -euo pipefail
 
 echo "🚀 Starting Router Service Smoke Test"
 
-# Start services
+# Start services with fresh database
+docker compose down -v 2>/dev/null || true
 docker compose up -d --build
 echo "⏳ Waiting for services to be ready..."
 sleep 15
+
+# Run database migrations
+echo "🔧 Running database migrations..."
+docker compose exec -T router alembic upgrade head
 
 # Health check
 echo "🔍 Checking health endpoint..."
@@ -18,6 +23,7 @@ echo "🔍 Testing main routing..."
 curl -fsS -X POST http://localhost:8000/route \
   -H 'Content-Type: application/json' \
   -H 'X-API-Key: dev-key' \
+  -H 'X-Tenant-Id: smoke-test' \
   -d '{
     "tenant_id": "smoke-test",
     "event_id": "smoke-event-123", 
@@ -33,6 +39,7 @@ echo "🔍 Testing duplicate detection..."
 RESPONSE=$(curl -fsS -X POST http://localhost:8000/route \
   -H 'Content-Type: application/json' \
   -H 'X-API-Key: dev-key' \
+  -H 'X-Tenant-Id: smoke-test' \
   -d '{
     "tenant_id": "smoke-test",
     "event_id": "smoke-event-123", 
