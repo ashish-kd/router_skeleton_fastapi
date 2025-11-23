@@ -58,13 +58,20 @@ wait_for_keypress
 
 # Demonstrate classification and routing
 demo_section "2. Signal Classification Demo"
-echo "Sending different types of signals to demonstrate classification..."
+echo "Sending different types of signals using specification format..."
 
 echo -e "\n🆘 ${RED}Emergency Signal${NC}:"
 EMERGENCY_RESPONSE=$(curl -s -X POST http://localhost:8000/route \
     -H "Content-Type: application/json" \
     -H "X-API-Key: dev-key" \
-    -d '{"sender_id":"demo_user","payload":{"message":"URGENT: Patient needs immediate help! Emergency situation!"}}')
+    -d '{
+        "tenant_id": "demo_tenant",
+        "user_id": "demo_user", 
+        "payload_version": 1,
+        "type": "emergency_alert",
+        "message": "URGENT: Patient needs immediate help! Emergency situation!",
+        "priority": "critical"
+    }')
 echo $EMERGENCY_RESPONSE | jq .
 echo "➡️  Routed to: $(echo $EMERGENCY_RESPONSE | jq -r '.routed_agents[]' | paste -sd ',' -)"
 
@@ -72,7 +79,15 @@ echo -e "\n📋 ${BLUE}Policy Signal${NC}:"
 POLICY_RESPONSE=$(curl -s -X POST http://localhost:8000/route \
     -H "Content-Type: application/json" \
     -H "X-API-Key: dev-key" \
-    -d '{"sender_id":"demo_user","payload":{"message":"Need help with HIPAA compliance policy for patient data"}}')
+    -d '{
+        "tenant_id": "demo_tenant",
+        "event_id": "policy_check_001",
+        "user_id": "demo_user",
+        "payload_version": 1,
+        "type": "policy_inquiry",
+        "text": "Need help with HIPAA compliance policy for patient data",
+        "category": "compliance"
+    }')
 echo $POLICY_RESPONSE | jq .
 echo "➡️  Routed to: $(echo $POLICY_RESPONSE | jq -r '.routed_agents[]' | paste -sd ',' -)"
 
@@ -80,9 +95,36 @@ echo -e "\n❓ ${YELLOW}General Assist Signal${NC}:"
 ASSIST_RESPONSE=$(curl -s -X POST http://localhost:8000/route \
     -H "Content-Type: application/json" \
     -H "X-API-Key: dev-key" \
-    -d '{"sender_id":"demo_user","payload":{"message":"Can you help me understand how to use this feature?"}}')
+    -d '{
+        "tenant_id": "demo_tenant",
+        "user_id": "demo_user",
+        "payload_version": 1,
+        "type": "help_request",
+        "message": "Can you help me understand how to use this feature?",
+        "support_level": "basic"
+    }')
 echo $ASSIST_RESPONSE | jq .
 echo "➡️  Routed to: $(echo $ASSIST_RESPONSE | jq -r '.routed_agents[]' | paste -sd ',' -)"
+
+echo -e "\n🫁 ${GREEN}Breath Check-in (Full Specification)${NC}:"
+BREATH_RESPONSE=$(curl -s -X POST http://localhost:8000/route \
+    -H "Content-Type: application/json" \
+    -H "X-API-Key: dev-key" \
+    -d '{
+        "tenant_id": "t1",
+        "event_id": "f0b8c5f2-8a0b-4b1d-9a9e-55b4f4c0b111",
+        "user_id": "u1",
+        "payload_version": 1,
+        "type": "breath_check_in",
+        "ts": "2025-09-20T10:20:30Z",
+        "biometrics": {
+            "breath_rate_bpm": 22,
+            "hrv_ms": 48
+        },
+        "text": "Feeling tight in my chest"
+    }')
+echo $BREATH_RESPONSE | jq .
+echo "➡️  Routed to: $(echo $BREATH_RESPONSE | jq -r '.routed_agents[]' | paste -sd ',' -)"
 
 wait_for_keypress
 
@@ -134,31 +176,31 @@ echo "   (This will create data visible in Grafana in real-time)"
 echo ""
 echo "Sending 50 mixed requests..."
 for i in {1..50}; do
-    # Mix of different request types
+    # Mix of different request types using specification format
     case $((i % 4)) in
         0) 
             curl -s -X POST http://localhost:8000/route \
                 -H "Content-Type: application/json" \
                 -H "X-API-Key: dev-key" \
-                -d "{\"sender_id\":\"load_test_$i\",\"payload\":{\"message\":\"URGENT crisis situation requiring immediate help!\"}}" > /dev/null
+                -d "{\"tenant_id\":\"load_test\",\"user_id\":\"load_test_$i\",\"payload_version\":1,\"type\":\"emergency_alert\",\"message\":\"URGENT crisis situation requiring immediate help!\",\"priority\":\"high\"}" > /dev/null
             ;;
         1)
             curl -s -X POST http://localhost:8000/route \
                 -H "Content-Type: application/json" \
                 -H "X-API-Key: dev-key" \
-                -d "{\"sender_id\":\"load_test_$i\",\"payload\":{\"message\":\"Policy compliance question about GDPR requirements\"}}" > /dev/null
+                -d "{\"tenant_id\":\"load_test\",\"user_id\":\"load_test_$i\",\"payload_version\":1,\"type\":\"policy_inquiry\",\"message\":\"Policy compliance question about GDPR requirements\",\"category\":\"compliance\"}" > /dev/null
             ;;
         2)
             curl -s -X POST http://localhost:8000/route \
                 -H "Content-Type: application/json" \
                 -H "X-API-Key: dev-key" \
-                -d "{\"sender_id\":\"load_test_$i\",\"payload\":{\"message\":\"Please help me understand this feature and explain the process\"}}" > /dev/null
+                -d "{\"tenant_id\":\"load_test\",\"user_id\":\"load_test_$i\",\"payload_version\":1,\"type\":\"help_request\",\"message\":\"Please help me understand this feature and explain the process\",\"support_level\":\"basic\"}" > /dev/null
             ;;
         3)
             curl -s -X POST http://localhost:8000/route \
                 -H "Content-Type: application/json" \
                 -H "X-API-Key: dev-key" \
-                -d "{\"sender_id\":\"load_test_$i\",\"payload\":{\"message\":\"Random message that doesn't match any pattern\"}}" > /dev/null
+                -d "{\"tenant_id\":\"load_test\",\"user_id\":\"load_test_$i\",\"payload_version\":1,\"type\":\"unknown_request\",\"message\":\"Random message that doesn't match any pattern\",\"category\":\"misc\"}" > /dev/null
             ;;
     esac
     

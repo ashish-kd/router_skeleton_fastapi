@@ -2,6 +2,8 @@ import time
 import asyncio
 import logging
 import structlog
+import jwt
+import os
 from typing import Dict, Callable, Any, Optional, List
 from datetime import datetime, timedelta
 from tenacity import (
@@ -14,6 +16,98 @@ from tenacity import (
 
 # Configure structured logging
 logger = structlog.get_logger()
+
+# JWT Configuration
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-key-change-in-prod")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_ISSUER = os.getenv("JWT_ISSUER", "coherence-auth") 
+JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "internal-services")
+
+# JWT Token Management
+def generate_jwt_token(
+    tenant: str,
+    roles: List[str],
+    sub: str = "router-service",
+    exp_hours: int = 24,
+    additional_claims: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Generate JWT token for development/admin purposes
+
+    Args:
+        tenant: Tenant identifier
+        roles: List of roles (admin, service, viewer, owner)
+        sub: Subject (service name or user identifier)
+        exp_hours: Token expiry in hours
+        additional_claims: Extra claims to include
+
+    Returns:
+        JWT token string
+    """
+    payload = {
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
+        "sub": sub,
+        "tenant": tenant,
+        "roles": roles,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + (exp_hours * 3600)
+    }
+
+    if additional_claims:
+        payload.update(additional_claims)
+
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+    # Log token generation without sensitive data
+    logger.info("JWT token generated",
+               sub=sub,
+               tenant=tenant,
+               roles=roles,
+               exp_hours=exp_hours)
+
+    return token
+
+def validate_jwt_token(token: str) -> Dict[str, Any]:
+    """
+    Validate JWT token and return payload
+
+    Args:
+        token: JWT token string
+
+    Returns:
+        Decoded payload dictionary
+
+    Raises:
+        HTTPException: If token is invalid/expired
+    """
+    from fastapi import HTTPException
+
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER
+        )
+
+        # Log successful validation (without sensitive data)
+        logger.debug("JWT token validated",
+                    sub=payload.get("sub"),
+                    tenant=payload.get("tenant"))
+
+        return payload
+
+    except jwt.ExpiredSignatureError:
+        logger.warning("JWT token expired", sub="unknown")
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError as e:
+        logger.warning("Invalid JWT token", error=str(e))
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception as e:
+        logger.error("JWT validation error", error=str(e))
+        raise HTTPException(status_code=401, detail="Token validation failed")
 
 # Rate limiting implementation
 class RateLimiter:

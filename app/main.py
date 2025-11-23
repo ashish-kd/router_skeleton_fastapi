@@ -3,6 +3,7 @@ import json
 import time
 import asyncio
 import httpx
+from datetime import datetime
 from typing import List, Optional, Dict, Any, Union
 from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -12,8 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db, execute_query, AsyncSessionLocal
 from app.metrics import instrumentator, timer, ROUTER_LATENCY_SECONDS, DLQ_BACKLOG, ROUTER_REJECTED_TOTAL
-from app.schemas import RouteRequest, RouteResponse, LogOut, HealthResponse
-from app.utils import rate_limiter, logger
+from app.schemas import RouteRequest, RouteResponse, LogOut, HealthResponse, TokenRequest
+from app.utils import rate_limiter, logger, validate_jwt_token, generate_jwt_token
 from app.logging import TraceMiddleware, init_logging
 from app.router import (
     classify, agents_for, now_iso, 
@@ -147,13 +148,76 @@ async def check_rate_limit(x_tenant_id: str = Header(None, alias="X-Tenant-ID"))
     # Rate limit by tenant_id from header (avoids consuming request body)
     # This works correctly behind load balancers/proxies unlike client IP
     tenant_id = x_tenant_id or "unknown"
-    
+
     # Check rate limit
     if not await rate_limiter.check_rate_limit(tenant_id):
         logger.warning("Rate limit exceeded", tenant_id=tenant_id)
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
-    
+
     return True
+
+# JWT Authentication Dependencies
+def require_admin_role(authorization: str = Header(None, alias="Authorization")) -> Dict[str, Any]:
+    """
+    Require admin role in JWT token for admin operations
+
+    Used for: /dlq/replay, /dlq/status, /logs
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        logger.warning("Missing JWT token for admin operation")
+        raise HTTPException(status_code=401, detail="Missing JWT token")
+
+    token = authorization.split(" ")[1]
+    payload = validate_jwt_token(token)
+
+    if "admin" not in payload.get("roles", []):
+        logger.warning("Insufficient permissions for admin operation",
+                      sub=payload.get("sub"),
+                      roles=payload.get("roles", []))
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    return payload
+
+def require_service_role(authorization: Optional[str] = Header(None, alias="Authorization")) -> Optional[Dict[str, Any]]:
+    """
+    Require service role in JWT token (optional for transitional period)
+
+    Used for: /route (transitional - accepts JWT with service role OR API key)
+    """
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        payload = validate_jwt_token(token)
+
+        if "service" not in payload.get("roles", []):
+            logger.warning("Insufficient permissions for service operation",
+                          sub=payload.get("sub"),
+                          roles=payload.get("roles", []))
+            raise HTTPException(status_code=403, detail="Service role required")
+
+        return payload
+    return None  # Allow fallback to API key for transitional period
+
+def authenticate_route_request(
+    service_jwt: Optional[Dict[str, Any]] = Depends(require_service_role),
+    x_api_key: str = Header(None)
+) -> Dict[str, Any]:
+    """
+    Combined authentication for /route endpoint
+
+    Accepts either:
+    1. JWT with service role, OR
+    2. API key (for transitional period)
+    """
+    if service_jwt:
+        # JWT authentication successful
+        return {"auth_type": "jwt", "payload": service_jwt}
+    elif x_api_key == API_KEY:
+        # API key authentication successful
+        return {"auth_type": "api_key", "api_key": x_api_key}
+    else:
+        # No valid authentication provided
+        logger.warning("Route request authentication failed - neither valid JWT nor API key provided")
+        raise HTTPException(status_code=401, detail="Authentication required (JWT service token or API key)")
 
 # Enhanced health check endpoint
 @app.get("/health", response_model=HealthResponse)
@@ -181,7 +245,7 @@ async def health(db: AsyncSession = Depends(get_db)):
     return health_data
 
 # Main routing endpoint with async processing
-@app.post("/route", response_model=RouteResponse, dependencies=[Depends(require_api_key), Depends(check_rate_limit)])
+@app.post("/route", response_model=RouteResponse, dependencies=[Depends(authenticate_route_request), Depends(check_rate_limit)])
 async def route(req: RouteRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     # Start timing the operation
     with timer(operation="total_route", kind=req.kind or req.type or "unknown"):
@@ -302,7 +366,7 @@ async def route(req: RouteRequest, background_tasks: BackgroundTasks, db: AsyncS
         )
 
 # Enhanced logs API with pagination
-@app.get("/logs", response_model=List[LogOut], dependencies=[Depends(require_api_key)])
+@app.get("/logs", response_model=List[LogOut], dependencies=[Depends(require_admin_role)])
 async def logs(
     sender_id: str = Query(...),
     limit: int = Query(100, ge=1, le=MAX_LOGS_LIMIT),
@@ -340,7 +404,7 @@ def metrics():
     return PlainTextResponse("# Prometheus metrics are served at /metrics by instrumentator")
 
 # DLQ manual replay endpoint
-@app.post("/dlq/replay", dependencies=[Depends(require_api_key)])
+@app.post("/dlq/replay", dependencies=[Depends(require_admin_role)])
 async def manual_dlq_replay(
     limit: int = Query(50, ge=1, le=500, description="Number of messages to replay"),
     dry_run: bool = Query(False, description="Preview without actually replaying")
@@ -380,7 +444,7 @@ async def manual_dlq_replay(
         raise HTTPException(status_code=500, detail=f"Replay failed: {str(e)}")
 
 # DLQ status endpoint
-@app.get("/dlq/status", dependencies=[Depends(require_api_key)])
+@app.get("/dlq/status", dependencies=[Depends(require_admin_role)])
 async def dlq_status(db: AsyncSession = Depends(get_db)):
     result = await db.execute(text("""
         SELECT COUNT(*) as count, 
@@ -413,3 +477,43 @@ async def dlq_status(db: AsyncSession = Depends(get_db)):
         "unique_logs": unique_logs,
         "reasons": reasons
     }
+
+# Token Generation Endpoint (Development/Admin Only)
+@app.post("/auth/token", dependencies=[Depends(check_rate_limit)])
+async def generate_token(request: TokenRequest):
+    """
+    Generate JWT token for development/testing purposes
+
+    This endpoint will be secured with proper authentication in production.
+    Rate-limited by tenant to prevent abuse.
+
+    Args:
+        request: TokenRequest with tenant, roles, sub, exp_hours
+    """
+    try:
+        token = generate_jwt_token(
+            tenant=request.tenant,
+            roles=request.roles,
+            sub=request.sub,
+            exp_hours=request.exp_hours
+        )
+
+        logger.info("JWT token generated successfully",
+                   tenant=request.tenant,
+                   roles=request.roles,
+                   sub=request.sub,
+                   exp_hours=request.exp_hours)
+
+        return {
+            "token": token,
+            "tenant": request.tenant,
+            "roles": request.roles,
+            "expires_in": f"{request.exp_hours} hours",
+            "issued_at": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.error("Token generation failed",
+                    tenant=request.tenant,
+                    error=str(e))
+        raise HTTPException(status_code=500, detail="Token generation failed")
