@@ -84,3 +84,21 @@ class DLQItem(BaseModel):
     payload: Dict[str, Any]
     attempts: int
     ts: str
+
+class TokenRequest(BaseModel):
+    """Request model for JWT token generation endpoint"""
+    tenant: str
+    roles: List[str] = ["service"]
+    sub: str = "router-service"
+    exp_hours: int = 24
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "tenant": "test-tenant",
+                "roles": ["admin"],
+                "sub": "test-user",
+                "exp_hours": 24
+            }
+        }
+    )

@@ -15,6 +15,7 @@ aiohttp==3.9.3
 redis==5.0.2
 limits==3.9.0
 structlog==24.1.0
+PyJWT==2.8.0
 
 # Testing dependencies
 pytest==7.4.0
